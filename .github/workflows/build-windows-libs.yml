@@ -1,0 +1,99 @@
+# Build a Windows runtime containing the fix from PR #6549
+# ("fix(agc): COPY_DATA to and from GDS").
+#
+# Put this file in your fork as .github/workflows/build-windows-libs.yml,
+# then run it manually from the Actions tab. Download the artifact named
+# anyps5-windows-libs-gds-fix when the job finishes.
+
+name: Build Windows libs (GDS COPY_DATA fix)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Switch to PR 6549 head
+        run: |
+          git fetch --depth 1 https://github.com/boykopovar/AnyPS5 refs/pull/6549/head
+          git checkout FETCH_HEAD
+
+      - name: Check out submodules
+        run: git submodule update --init --recursive --depth 1 --jobs 8
+
+      - name: Use the CA bundle of Git for Windows
+        run: |
+          for prefix in ucrt64 mingw64; do
+            bundle="C:/Program Files/Git/$prefix/etc/ssl/certs/ca-bundle.crt"
+            if [ -f "$bundle" ]; then echo "SSL_CERT_FILE=$bundle" >> "$GITHUB_ENV"; exit 0; fi
+          done
+          echo "::error::No CA bundle found in Git for Windows"; exit 1
+
+      - id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: Add-Content -LiteralPath $env:GITHUB_PATH -Value "$env:MSYS2_LOCATION\ucrt64\bin"
+
+      - name: Configure
+        shell: cmd
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DBUILD_TESTING=OFF
+
+      - name: Build relinker
+        shell: cmd
+        run: cmake --build build --parallel
+
+      - name: Build system libraries
+        shell: cmd
+        run: cmake --build build --target libs --parallel
+
+      - name: Copy MinGW runtime DLLs beside the libraries
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $bin = Join-Path $env:MSYS2_LOCATION 'ucrt64\bin'
+          $dst = 'build/core/libs/libs'
+          foreach ($n in @('libgcc_s_seh-1.dll','libstdc++-6.dll','libwinpthread-1.dll')) {
+            $src = Join-Path $bin $n
+            if (Test-Path -LiteralPath $src) {
+              Copy-Item -LiteralPath $src -Destination $dst -Force
+            } else {
+              Write-Host "warning: $n not found in $bin"
+            }
+          }
+
+      - name: Stage deliverables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item -Recurse -Force build/core/libs/libs out/libs
+          $exe = Get-ChildItem -Path build -Filter relinker.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) { Copy-Item -LiteralPath $exe.FullName -Destination out/relinker.exe }
+          Get-ChildItem -Recurse out | Measure-Object | ForEach-Object { Write-Host "staged $($_.Count) files" }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: anyps5-windows-libs-gds-fix
+          path: out
+          retention-days: 14
+          if-no-files-found: error
